@@ -155,7 +155,11 @@ pub fn qtensor_from_ggml(
         }
         GgmlDType::Q2K => from_raw_data::<k_quants::BlockQ2K>(raw_data, size_in_bytes, dims),
         GgmlDType::Q3K => from_raw_data::<k_quants::BlockQ3K>(raw_data, size_in_bytes, dims),
-        GgmlDType::Q4K => from_raw_data::<k_quants::BlockQ4K>(raw_data, size_in_bytes, dims),
+        GgmlDType::Q4K => {
+            let blocks = blocks_from_raw::<k_quants::BlockQ4K>(raw_data, size_in_bytes);
+            let storage = super::repack_q4k::q4k_storage(blocks, &dims);
+            super::QTensor::new(storage, dims)
+        }
         GgmlDType::Q5K => from_raw_data::<k_quants::BlockQ5K>(raw_data, size_in_bytes, dims),
         GgmlDType::Q6K => from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims),
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),

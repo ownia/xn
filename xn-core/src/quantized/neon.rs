@@ -672,6 +672,120 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> Res
     Ok(sumf)
 }
 
+pub(crate) fn matmul_q4k_q8k(
+    lhs: &[BlockQ8K],
+    weights: &[BlockQ4K],
+    dst: &mut [f32],
+    rows: usize,
+    columns: usize,
+    depth: usize,
+) {
+    let blocks = depth / QK_K;
+    crate::threadpool::par_chunks_mut_by(
+        rows * columns * depth,
+        dst,
+        columns * 4,
+        |tile, piece| {
+            let activation = &lhs[tile * 4 * blocks..];
+            match piece.len() / columns {
+                4 => q4k_rows::<4>(activation, weights, piece, columns, blocks),
+                3 => q4k_rows::<3>(activation, weights, piece, columns, blocks),
+                2 => q4k_rows::<2>(activation, weights, piece, columns, blocks),
+                1 => q4k_rows::<1>(activation, weights, piece, columns, blocks),
+                _ => unreachable!(),
+            }
+        },
+    );
+}
+
+fn q4k_rows<const ROWS: usize>(
+    lhs: &[BlockQ8K],
+    weights: &[BlockQ4K],
+    dst: &mut [f32],
+    columns: usize,
+    blocks: usize,
+) {
+    for column in 0..columns {
+        let weight = &weights[column * blocks..(column + 1) * blocks];
+        let values = vec_dot_q4k_q8k_tile::<ROWS>(weight, lhs, blocks);
+        for row in 0..ROWS {
+            dst[row * columns + column] = values[row];
+        }
+    }
+}
+
+#[inline(always)]
+fn vec_dot_q4k_q8k_tile<const ROWS: usize>(
+    weights: &[BlockQ4K],
+    lhs: &[BlockQ8K],
+    stride: usize,
+) -> [f32; ROWS] {
+    let mut sums = [0.0f32; ROWS];
+    let mut metadata = [0u32; 4];
+    let mut scales = [0u8; 16];
+    const MASK_6: u32 = 0x3f3f3f3f;
+    const MASK_4: u32 = 0x0f0f0f0f;
+    const MASK_2: u32 = 0x03030303;
+    unsafe {
+        let nibble_mask = vdupq_n_u8(0xF);
+        for (block_index, weight) in weights.iter().enumerate() {
+            let weight_scale = weight.d.to_f32();
+            let weight_min = weight.dmin.to_f32();
+            LittleEndian::read_u32_into(&weight.scales, &mut metadata[..3]);
+            let minimum_bits = vld1_u32(
+                [
+                    metadata[1] & MASK_6,
+                    ((metadata[2] >> 4) & MASK_4) | (((metadata[1] >> 6) & MASK_2) << 4),
+                ]
+                .as_ptr(),
+            );
+            let minimums = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(minimum_bits)));
+            metadata[1] = (metadata[2] & MASK_4) | (((metadata[0] >> 6) & MASK_2) << 4);
+            metadata[0] &= MASK_6;
+            LittleEndian::write_u32_into(&metadata, &mut scales);
+
+            for row in 0..ROWS {
+                let activation = &lhs[row * stride + block_index];
+                let block_sums = vpaddq_s16(
+                    vld1q_s16(activation.bsums.as_ptr()),
+                    vld1q_s16(activation.bsums.as_ptr().add(8)),
+                );
+                let correction = vaddq_s32(
+                    vmull_s16(vget_low_s16(block_sums), vget_low_s16(minimums)),
+                    vmull_s16(vget_high_s16(block_sums), vget_high_s16(minimums)),
+                );
+                let minimum_scale = activation.d * weight_min;
+                sums[row] -= minimum_scale * vaddvq_s32(correction) as f32;
+            }
+
+            let mut integer_sums = [0i32; ROWS];
+            for group in 0..QK_K / 64 {
+                let bits = vld1q_u8_x2(weight.qs.as_ptr().add(group * 32));
+                let low_first = vreinterpretq_s8_u8(vandq_u8(bits.0, nibble_mask));
+                let low_second = vreinterpretq_s8_u8(vandq_u8(bits.1, nibble_mask));
+                let high_first = vreinterpretq_s8_u8(vshrq_n_u8(bits.0, 4));
+                let high_second = vreinterpretq_s8_u8(vshrq_n_u8(bits.1, 4));
+                for row in 0..ROWS {
+                    let activation = &lhs[row * stride + block_index];
+                    let bytes = vld1q_s8_x4(activation.qs.as_ptr().add(group * 64));
+                    let low_dot =
+                        vaddq_s32(vdotq_s32(low_first, bytes.0), vdotq_s32(low_second, bytes.1));
+                    let high_dot =
+                        vaddq_s32(vdotq_s32(high_first, bytes.2), vdotq_s32(high_second, bytes.3));
+                    integer_sums[row] += vaddvq_s32(low_dot) * scales[group * 2] as i32
+                        + vaddvq_s32(high_dot) * scales[group * 2 + 1] as i32;
+                }
+            }
+            for row in 0..ROWS {
+                let activation = &lhs[row * stride + block_index];
+                let scale = activation.d * weight_scale;
+                sums[row] += scale * integer_sums[row] as f32;
+            }
+        }
+    }
+    sums
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> Result<f32> {
     if !n.is_multiple_of(QK_K) {

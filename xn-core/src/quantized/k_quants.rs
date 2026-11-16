@@ -89,6 +89,31 @@ fn matmul_by_row<T: GgmlType>(
     Ok(())
 }
 
+#[cfg(target_feature = "neon")]
+#[tracing::instrument(name = "q4k-matmul-prefill", skip_all, fields(rows, columns, depth))]
+fn matmul_q4k_prefill(
+    lhs: &[BlockQ8K],
+    weights: &[BlockQ4K],
+    dst: &mut [f32],
+    rows: usize,
+    columns: usize,
+    depth: usize,
+) -> Result<()> {
+    if !depth.is_multiple_of(QK_K) {
+        crate::bail!("q4k matmul: depth {depth} is not divisible by {QK_K}")
+    }
+    let blocks = depth / QK_K;
+    if lhs.len() < rows * blocks || weights.len() < columns * blocks || dst.len() < rows * columns {
+        crate::bail!("q4k matmul: buffers too small for [{rows}, {depth}, {columns}]")
+    }
+    if rows == 0 || columns == 0 || depth == 0 {
+        dst[..rows * columns].fill(0.0);
+        return Ok(());
+    }
+    super::neon::matmul_q4k_q8k(lhs, weights, &mut dst[..rows * columns], rows, columns, depth);
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockQ4_0 {
@@ -1321,6 +1346,24 @@ impl GgmlType for BlockQ4K {
     const DTYPE: GgmlDType = GgmlDType::Q4K;
     const BLCK_SIZE: usize = QK_K;
     type VecDotType = BlockQ8K;
+
+    fn matmul(
+        lhs: &[BlockQ8K],
+        weights: &[Self],
+        dst: &mut [f32],
+        rows: usize,
+        columns: usize,
+        depth: usize,
+    ) -> Result<()> {
+        #[cfg(target_feature = "neon")]
+        if rows >= crate::get_num_threads().saturating_mul(4).max(8)
+            && columns >= 128
+            && std::env::var("XN_Q4K_TILED").as_deref() != Ok("0")
+        {
+            return matmul_q4k_prefill(lhs, weights, dst, rows, columns, depth);
+        }
+        matmul_by_row(lhs, weights, dst, rows, columns, depth)
+    }
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32> {

@@ -15,6 +15,7 @@ pub mod kai;
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod neon;
 pub mod repack;
+pub mod repack_q4k;
 #[cfg(target_feature = "simd128")]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod simd128;
@@ -295,6 +296,12 @@ impl QTensor {
             let mut blocks = vec![BlockQ8_0::zeros(); elem_count / QK8_0];
             BlockQ8_0::from_float(src, &mut blocks)?;
             let storage = repack::q8_0_storage_owned(blocks, shape.dims());
+            return Ok(Self { storage, shape: shape.clone() });
+        }
+        if dtype == GgmlDType::Q4K {
+            let mut blocks = vec![BlockQ4K::zeros(); elem_count / QK_K];
+            BlockQ4K::from_float(src, &mut blocks)?;
+            let storage = repack_q4k::q4k_storage_owned(blocks, shape.dims());
             return Ok(Self { storage, shape: shape.clone() });
         }
         let mut storage = QStorage::Cpu(dtype.cpu_zeros(elem_count));
